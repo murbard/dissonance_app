@@ -12,7 +12,7 @@ def sethares_pair_dissonance(f1, f2, alpha=0.021, beta=19.0):
     return np.exp(-3.5 * s) - np.exp(-5.75 * s)
 
 def run_sweep():
-    sr = 22050
+    sr = 44100
     base_freq = 440.0
     # Sweep from Unison (ratio 1.0) to Octave (ratio 2.0)
     ratios = np.linspace(1.0, 2.3, 100)
@@ -20,7 +20,7 @@ def run_sweep():
     computed_dissonance = []
     theoretical_dissonance = []
     
-    print(f"Sweeping intervals from unison to >octave ({len(ratios)} steps)...")
+    print(f"Sweeping intervals from unison to >octave ({len(ratios)} steps) at SR={sr}...")
     
     for r in ratios:
         f2 = base_freq * r
@@ -34,7 +34,9 @@ def run_sweep():
         sig = torch.sin(2 * 3.14159 * base_freq * t) + torch.sin(2 * 3.14159 * f2 * t)
         
         # Compute
-        curve, integral = timbral_dissonance(sig, sr)
+        # User requested 250ms window. 44100 * 0.25 = 11025.
+        # Next power of 2 is 16384 (approx 371ms resolution).
+        curve, integral = timbral_dissonance(sig, sr, n_fft=16384)
         computed_dissonance.append(integral)
         
         # Theoretical (Sethares)
