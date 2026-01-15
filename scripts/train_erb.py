@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import numpy as np
 import scipy.signal
 import matplotlib.pyplot as plt
+import os
 
 
 def sample_f0_piano(n_samples):
@@ -161,20 +162,30 @@ def train():
     print(f"Training on {device}")
     
     sr = 22050
-    model = ERBSineBasisModel(fs=sr, n_bands=16, filter_length_ms=50, n_coeffs=16).to(device)
+    model = ERBSineBasisModel(fs=sr, n_bands=32, filter_length_ms=100, n_coeffs=32).to(device)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Learnable parameters: {n_params}")
     
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    # 6 f0 values for validation (A1 to A6)
-    val_f0s = [55.0, 110.0, 220.0, 440.0, 880.0, 1760.0]
+    # Load checkpoint if exists
+    checkpoint_path = 'best_erb_params.pt'
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        print(f"Loaded checkpoint from {checkpoint_path}, best_val_loss: {best_val_loss:.5f}")
+    else:
+        best_val_loss = float('inf')
+        print("No checkpoint found, starting fresh.")
+    
+    # 9 f0 values for validation (A1 to A6)
+    val_f0s = [120, 155, 188, 223, 262, 307, 363, 441, 572]
     val_ratios = np.linspace(1.0, 2.25, 100)
     
-    batch_size = 32
-    n_steps = 500
-    best_val_loss = float('inf')
+    batch_size = 256
+    n_steps = 10000
     mse_criterion = nn.MSELoss()
     
     print("Starting training with varied f0...")
@@ -253,7 +264,7 @@ def compute_val_loss(model, f0s, ratios, sr, device, criterion):
 
 
 def save_plot(model, f0s, ratios, sr, device, loss, step):
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
     axes = axes.flatten()
     t = torch.linspace(0, 0.5, int(sr * 0.5), device=device)
     
