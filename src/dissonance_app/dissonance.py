@@ -43,15 +43,36 @@ def precompute_dissonance_matrix(freqs, alpha=0.021, beta=19.0, ignore_bins=4):
     
     return d_mat
 
-def timbral_dissonance(audio: torch.Tensor, sr: int, n_fft: int = 4096, hop_length: int = 512, alpha: float = 0.021, beta: float = 19.0, ignore_bins: int = 4):
+def blackman_nuttall_window(M, device=None):
+    """
+    Generate Blackman-Nuttall window of length M.
+    """
+    if device is None:
+        device = torch.device('cpu')
+        
+    n = torch.arange(0, M, device=device)
+    # Coefficients
+    a0 = 0.3635819
+    a1 = 0.4891775
+    a2 = 0.1365995
+    a3 = 0.0106411
+    
+    term1 = a1 * torch.cos(2 * math.pi * n / (M - 1))
+    term2 = a2 * torch.cos(4 * math.pi * n / (M - 1))
+    term3 = a3 * torch.cos(6 * math.pi * n / (M - 1))
+    
+    w = a0 - term1 + term2 - term3
+    return w
+
+def timbral_dissonance(audio: torch.Tensor, sr: int, n_fft: int = 32768, hop_length: int = 4410, alpha: float = 0.021, beta: float = 19.0, ignore_bins: int = 4):
     """
     Compute the dissonance curve and integral for a raw audio signal using dense STFT interactions.
     
     Args:
         audio: (Tensor) Raw audio samples, 1D or (1, T).
         sr: (int) Sample rate.
-        n_fft: (int) FFT size. Default increased to 4096 for better freq resolution.
-        hop_length: (int) STFT hop length.
+        n_fft: (int) FFT size. Default 32768 (requested).
+        hop_length: (int) STFT hop length. Default ~0.1s (4410 samples).
         alpha: (float) Scale factor for critical bandwidth (Sethares default 0.021).
         beta: (float) Offset for critical bandwidth (Sethares default 19.0).
         ignore_bins: (int) Number of adjacent bins to ignore (diagonal filtering).
@@ -66,7 +87,14 @@ def timbral_dissonance(audio: torch.Tensor, sr: int, n_fft: int = 4096, hop_leng
     device = audio.device
     
     # STFT
-    window = torch.hann_window(n_fft).to(device)
+    # Window: Blackman-Nuttall
+    # win_length defaults to n_fft if not specified in stft? 
+    # torch.stft uses win_length=n_fft by default if win_length is None.
+    # explicit logic:
+    win_length = n_fft
+    window = blackman_nuttall_window(win_length, device=device)
+    
+    # Center padding is True by default in stft
     stft = torch.stft(audio, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
     magnitude = torch.abs(stft).transpose(0, 1) # [frames, bins]
     

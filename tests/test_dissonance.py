@@ -51,7 +51,7 @@ def test_plomp_levelt_curve_shape():
     for r in ratios:
         f2 = base_freq * r
         sig = generate_sine(base_freq, sr, 0.2) + generate_sine(f2, sr, 0.2)
-        _, integral = timbral_dissonance(sig, sr, n_fft=4096)
+        _, integral = timbral_dissonance(sig, sr, n_fft=32768)
         vals_comp.append(integral)
         
         # Theory

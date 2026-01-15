@@ -34,9 +34,8 @@ def run_sweep():
         sig = torch.sin(2 * 3.14159 * base_freq * t) + torch.sin(2 * 3.14159 * f2 * t)
         
         # Compute
-        # User requested 250ms window. 44100 * 0.25 = 11025.
-        # Next power of 2 is 16384 (approx 371ms resolution).
-        curve, integral = timbral_dissonance(sig, sr, n_fft=16384)
+        # User requested n_fft=32768
+        curve, integral = timbral_dissonance(sig, sr, n_fft=32768)
         computed_dissonance.append(integral)
         
         # Theoretical (Sethares)
