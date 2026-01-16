@@ -1,22 +1,18 @@
 """
-Sine basis filter training for ERB roughness optimization.
-Multi-f0 version: trains across piano range using Beta(7,7) distribution.
+Deep CNN for roughness estimation.
+Replaces the ERB-based model with a 1D CNN that has more capacity.
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
-import scipy.signal
 import matplotlib.pyplot as plt
 import os
 
 
 def sample_f0_piano(n_samples):
-    """
-    Sample f0 from piano range using Beta(7,7) distribution.
-    f0 = 440 * 2^((20 + 80*b - 69) / 12) where b ~ Beta(7,7)
-    """
+    """Sample f0 from piano range using Beta(7,7) distribution."""
     b = np.random.beta(7, 7, n_samples)
     midi_note = 20 + 80 * b
     f0 = 440 * (2 ** ((midi_note - 69) / 12))
@@ -33,25 +29,13 @@ def sethares_pairwise(f1, f2, a1, a2, alpha=0.021, beta=19.0):
 
 
 def get_theoretical_dissonance(f0, ratio, n_harmonics=12, amp_power=1.0, inharmonicity=None):
-    """
-    Sethares dissonance for two harmonic tones at f0 and f0*ratio.
-    
-    Args:
-        f0: fundamental frequency
-        ratio: frequency ratio of second tone
-        n_harmonics: number of harmonics
-        amp_power: amplitude = 1/n^amp_power (1.0=sawtooth, 2.0=softer)
-        inharmonicity: array of log-frequency shifts per harmonic, or None for perfect harmonics
-    """
+    """Sethares dissonance for two harmonic tones."""
     f1_base = f0
     f2_base = f0 * ratio
     
-    # Generate harmonics for both tones
-    freqs1 = []
-    freqs2 = []
+    freqs1, freqs2 = [], []
     for n in range(1, n_harmonics + 1):
         if inharmonicity is not None:
-            # Apply inharmonicity: multiply frequency by exp(shift)
             shift = inharmonicity[n - 1]
             freqs1.append(f1_base * n * np.exp(shift))
             freqs2.append(f2_base * n * np.exp(shift))
@@ -62,26 +46,15 @@ def get_theoretical_dissonance(f0, ratio, n_harmonics=12, amp_power=1.0, inharmo
     amps1 = [1.0 / (n ** amp_power) for n in range(1, n_harmonics + 1)]
     amps2 = [1.0 / (n ** amp_power) for n in range(1, n_harmonics + 1)]
     
-    # Sum all pairwise dissonances between the two tones
     total_d = 0.0
     for fi, ai in zip(freqs1, amps1):
         for fj, aj in zip(freqs2, amps2):
             total_d += sethares_pairwise(fi, fj, ai, aj)
-    
     return total_d
 
 
 def generate_harmonic_tone(f0, t, n_harmonics=12, amp_power=1.0, inharmonicity=None):
-    """
-    Generate a harmonic tone with configurable amplitude falloff and inharmonicity.
-    
-    Args:
-        f0: fundamental frequency
-        t: time tensor
-        n_harmonics: number of harmonics
-        amp_power: amplitude = 1/n^amp_power (1.0=sawtooth, 2.0=softer)
-        inharmonicity: tensor of log-frequency shifts per harmonic, or None
-    """
+    """Generate a harmonic tone with configurable amplitude falloff and inharmonicity."""
     sig = torch.zeros_like(t)
     for n in range(1, n_harmonics + 1):
         amp = 1.0 / (n ** amp_power)
@@ -93,181 +66,97 @@ def generate_harmonic_tone(f0, t, n_harmonics=12, amp_power=1.0, inharmonicity=N
     return sig
 
 
-class SineBasisFilter(nn.Module):
-    """Filter parameterized by sine basis: h[n] = Σₖ bₖ · sin(πk·n/N)"""
-    def __init__(self, filter_length, n_coeffs, init_from_scipy=None):
+class RoughnessCNN(nn.Module):
+    """
+    1D CNN for roughness estimation.
+    Uses strided convolutions to progressively downsample, then global pooling.
+    """
+    def __init__(self, base_channels=32):
         super().__init__()
-        self.filter_length = filter_length
-        self.n_coeffs = n_coeffs
         
-        t = torch.linspace(0, 1, filter_length)
-        k = torch.arange(1, n_coeffs + 1).float()
-        basis = torch.sin(np.pi * k.unsqueeze(0) * t.unsqueeze(1))
-        self.register_buffer('basis', basis)
+        # Initial projection
+        self.conv1 = nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm1d(base_channels)
         
-        if init_from_scipy is not None:
-            init_coeffs = self._project_to_sine_basis(init_from_scipy)
-        else:
-            init_coeffs = torch.randn(n_coeffs) * 0.01
+        # Downsampling blocks
+        self.block1 = self._make_block(base_channels, base_channels * 2, stride=4)
+        self.block2 = self._make_block(base_channels * 2, base_channels * 4, stride=4)
+        self.block3 = self._make_block(base_channels * 4, base_channels * 8, stride=4)
+        self.block4 = self._make_block(base_channels * 8, base_channels * 8, stride=4)
         
-        self.coeffs = nn.Parameter(init_coeffs)
+        # Global pooling + output
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(base_channels * 8, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
     
-    def _project_to_sine_basis(self, filter_taps):
-        if len(filter_taps) != self.filter_length:
-            filter_taps = np.interp(
-                np.linspace(0, 1, self.filter_length),
-                np.linspace(0, 1, len(filter_taps)),
-                filter_taps
-            )
-        basis_np = self.basis.numpy()
-        coeffs, _, _, _ = np.linalg.lstsq(basis_np, filter_taps, rcond=None)
-        return torch.from_numpy(coeffs).float()
-    
-    def get_taps(self):
-        return self.basis @ self.coeffs
+    def _make_block(self, in_ch, out_ch, stride):
+        return nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=7, stride=stride, padding=3),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(),
+            nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU()
+        )
     
     def forward(self, x):
-        """Apply filter via FFT convolution (much faster for long filters)."""
-        taps = self.get_taps()
+        # x: (batch, samples)
+        x = x.unsqueeze(1)  # (batch, 1, samples)
         
-        # FFT convolution
-        n_fft = x.shape[-1] + self.filter_length - 1
-        # Round up to power of 2 for efficiency
-        n_fft = 2 ** int(np.ceil(np.log2(n_fft)))
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
         
-        X = torch.fft.rfft(x, n=n_fft)
-        H = torch.fft.rfft(taps, n=n_fft)
-        Y = X * H
-        y = torch.fft.irfft(Y, n=n_fft)
-        
-        # Trim to original length (centered)
-        start = self.filter_length // 2
-        y = y[..., start:start + x.shape[-1]]
-        
-        return y
-
-
-class ERBSineBasisModel(nn.Module):
-    """ERB roughness model using sine basis filters with per-band capacity."""
-    def __init__(self, fs=22050, n_bands=16, filter_length_ms=50, n_coeffs=16):
-        super().__init__()
-        self.fs = fs
-        self.n_bands = n_bands
-        self.filter_length = int(filter_length_ms * fs / 1000)
-        
-        # Modulation bandpass (20-200 Hz)
-        mod_fir = scipy.signal.firwin(self.filter_length, [20, 200], pass_zero=False, fs=fs)
-        self.mod_filter = SineBasisFilter(self.filter_length, n_coeffs, init_from_scipy=mod_fir)
-        
-        # Level lowpass (10 Hz)
-        level_length = int(200 * fs / 1000)
-        level_fir = scipy.signal.firwin(level_length, 10, fs=fs)
-        self.level_filter = SineBasisFilter(level_length, n_coeffs, init_from_scipy=level_fir)
-        
-        # Per-band bandpass filters
-        fmin, fmax = 20.0, min(10000.0, fs/2 * 0.9)
-        erb_lo = 21.4 * np.log10(0.00437 * fmin + 1)
-        erb_hi = 21.4 * np.log10(0.00437 * fmax + 1)
-        erb_centers = np.linspace(erb_lo, erb_hi, n_bands)
-        hz_centers = (10 ** (erb_centers / 21.4) - 1) / 0.00437
-        
-        self.band_filters = nn.ModuleList()
-        self.env_filters = nn.ModuleList()  # Per-band envelope filters
-        
-        for i, fc in enumerate(hz_centers):
-            # Band filter
-            bw = 24.7 + 0.108 * fc
-            lo = max(1.0, fc - bw/2)
-            hi = min(fs/2 * 0.95, fc + bw/2)
-            if hi > lo:
-                band_fir = scipy.signal.firwin(self.filter_length, [lo, hi], pass_zero=False, fs=fs)
-            else:
-                band_fir = np.zeros(self.filter_length)
-                band_fir[self.filter_length // 2] = 1.0
-            self.band_filters.append(SineBasisFilter(self.filter_length, n_coeffs, init_from_scipy=band_fir))
-            
-            # Per-band envelope filter: higher bands get faster envelope (100-300 Hz cutoff)
-            env_cutoff = 100 + 200 * (i / max(1, n_bands - 1))  # 100 Hz for low bands, 300 Hz for high
-            env_fir = scipy.signal.firwin(self.filter_length, env_cutoff, fs=fs)
-            self.env_filters.append(SineBasisFilter(self.filter_length, n_coeffs, init_from_scipy=env_fir))
-        
-        # Per-band learnable weights (initialized to 1.0)
-        self.band_weights = nn.Parameter(torch.ones(n_bands))
-        
-        self.level_compression = nn.Parameter(torch.tensor(0.3))
-        self.rms_win = int(10e-3 * fs)
-    
-    def _apply_band_filter(self, x, band_idx):
-        return self.band_filters[band_idx](x)
-    
-    def forward(self, x):
-        batch_size, n_samples = x.shape
-        R_accum = torch.zeros_like(x)
-        
-        for b in range(self.n_bands):
-            y = self._apply_band_filter(x, b)
-            env = torch.abs(y)
-            env = self.env_filters[b](env)  # Per-band envelope
-            level = self.level_filter(env)
-            mod = self.mod_filter(env)
-            
-            mod_sq = mod * mod
-            rms_sq = F.avg_pool1d(mod_sq.unsqueeze(1), self.rms_win, stride=1, padding=self.rms_win//2).squeeze(1)
-            if rms_sq.shape[-1] > n_samples:
-                rms_sq = rms_sq[..., :n_samples]
-            rough = torch.sqrt(rms_sq + 1e-10)
-            
-            comp = torch.clamp(self.level_compression, 0.1, 1.0)
-            weight = torch.pow(torch.clamp(level, min=1e-10), comp)
-            # Apply per-band learnable weight
-            band_w = torch.clamp(self.band_weights[b], 0.0, 10.0)
-            R_accum = R_accum + band_w * weight * rough
-        
-        return R_accum.mean(dim=-1)
+        return self.head(x).squeeze(-1)
 
 
 def train():
-    device = torch.device('cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on {device}")
     
     sr = 22050
-    model = ERBSineBasisModel(fs=sr, n_bands=32, filter_length_ms=100, n_coeffs=32).to(device)
+    model = RoughnessCNN(base_channels=32).to(device)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Learnable parameters: {n_params}")
     
     optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=50, factor=0.5)
     
     # Load checkpoint if exists
-    checkpoint_path = 'best_erb_sinebasis.pt'
+    checkpoint_path = 'best_cnn_roughness.pt'
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         if 'model_state_dict' in checkpoint:
-            # Use strict=False to allow architecture changes
             result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             if result.missing_keys or result.unexpected_keys:
                 print(f"Partial load - missing: {len(result.missing_keys)}, unexpected: {len(result.unexpected_keys)}")
-                print("Starting with fresh validation loss target.")
                 best_val_loss = float('inf')
             else:
                 best_val_loss = checkpoint.get('val_loss', float('inf'))
-                print(f"Loaded checkpoint from {checkpoint_path}, best_val_loss: {best_val_loss:.5f}")
+                print(f"Loaded checkpoint, best_val_loss: {best_val_loss:.5f}")
         else:
-            print(f"Checkpoint format incompatible, starting fresh.")
             best_val_loss = float('inf')
     else:
         best_val_loss = float('inf')
         print("No checkpoint found, starting fresh.")
     
-    # 16 f0 values for validation
+    # Validation frequencies
     val_f0s = [102, 126, 147, 167, 186, 207, 227, 250, 274, 301, 331, 367, 410, 465, 541, 670]
     val_ratios = np.linspace(1.0, 2.25, 100)
     
-    batch_size = 256
-    n_steps = 10000
+    batch_size = 64
+    n_steps = 20000
     mse_criterion = nn.MSELoss()
+    n_harmonics = 12
     
-    print("Starting training with varied f0...")
+    print("Starting CNN training...")
     
     for step in range(n_steps):
         model.train()
@@ -283,7 +172,6 @@ def train():
         amp_powers = np.random.choice([1.0, 2.0], size=batch_size)
         
         # Sample inharmonicity: ±3% log-frequency shift per harmonic
-        n_harmonics = 12
         inharmonicities = np.random.uniform(-0.03, 0.03, size=(batch_size, n_harmonics))
         
         # Compute targets
@@ -324,6 +212,7 @@ def train():
             with torch.no_grad():
                 val_loss = compute_val_loss(model, val_f0s, val_ratios, sr, device, mse_criterion)
             
+            scheduler.step(val_loss)
             print(f"Step {step}: TrainLoss {loss.item():.5f}, ValLoss {val_loss:.5f}")
             
             if val_loss < best_val_loss:
@@ -376,16 +265,16 @@ def save_plot(model, f0s, ratios, sr, device, loss, step):
         preds_norm = (preds - preds.min()) / (preds.max() - preds.min() + 1e-8)
         
         ax.plot(ratios, theory_norm, 'k-', lw=2, label='Theoretical')
-        ax.plot(ratios, preds_norm, 'r--', lw=2, label='ERB Model')
+        ax.plot(ratios, preds_norm, 'r--', lw=2, label='CNN Model')
         ax.set_xlabel('Frequency Ratio')
         ax.set_ylabel('Normalized Dissonance')
         ax.set_title(f'f0 = {f0:.0f} Hz')
         ax.legend()
         ax.grid(alpha=0.3)
     
-    fig.suptitle(f'Multi-F0 Validation (Step {step}, Val Loss: {loss:.5f})', fontsize=14)
+    fig.suptitle(f'CNN Roughness Model (Step {step}, Val Loss: {loss:.5f})', fontsize=14)
     plt.tight_layout()
-    plt.savefig('best_erb_fit.png', dpi=100)
+    plt.savefig('best_cnn_fit.png', dpi=100)
     plt.close()
 
 
